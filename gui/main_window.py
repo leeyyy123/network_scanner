@@ -9,16 +9,30 @@ from PyQt5.QtWidgets import QMainWindow, QMessageBox, QApplication
 from PyQt5.QtCore import QThread, pyqtSignal
 from gui.ui_main import UiMain
 from core.logger import log
-from core.host_scan import scan_hosts, parse_ip_range
+from core.host_scan import scan_hosts
 from core.port_scan import scan_ports
+
+
+class StopFlag:
+    """停止标志类"""
+    def __init__(self):
+        self.value = 0
+
+    def stop(self):
+        self.value = 1
+
+    def reset(self):
+        self.value = 0
 
 
 class ScanThread(QThread):
     """扫描线程 - 在后台执行扫描任务"""
 
-    progress_updated = pyqtSignal(int, int, int)  # progress, scanned, total
-    log_message = pyqtSignal(str, str)  # message, level
-    result_ready = pyqtSignal(str)  # 单条结果文本
+    progress_updated = pyqtSignal(int, int, int)
+    log_message = pyqtSignal(str, str)
+    host_found = pyqtSignal(str)
+    port_found = pyqtSignal(str, int, str)
+    scan_complete = pyqtSignal()
 
     def __init__(self, host, port_range, timeout, max_workers):
         super().__init__()
@@ -26,84 +40,81 @@ class ScanThread(QThread):
         self.port_range = port_range
         self.timeout = timeout
         self.max_workers = max_workers
-        self._stop_flag = False
+        self.stop_flag = StopFlag()
 
     def stop(self):
         """请求停止扫描"""
-        self._stop_flag = True
+        self.stop_flag.stop()
+        self.log_message.emit("[停止] 正在停止扫描...", 'warning')
 
     def run(self):
         """执行扫描"""
-        results = []
-
         try:
             # 阶段1: 主机扫描
             self.log_message.emit(f"开始主机发现: {self.host}", 'info')
 
             def host_progress(progress, scanned, total):
-                if not self._stop_flag:
-                    self.progress_updated.emit(
-                        int(progress / 2),
-                        scanned,
-                        total
-                    )
+                self.progress_updated.emit(int(progress / 2), scanned, total)
+
+            # 主机发现时实时通知
+            def host_found_callback(ip):
+                self.host_found.emit(ip)
 
             alive_hosts = scan_hosts(
                 self.host,
                 max_workers=self.max_workers,
                 timeout=self.timeout,
-                progress_callback=host_progress
+                progress_callback=host_progress,
+                stop_flag=self.stop_flag,
+                host_found_callback=host_found_callback
             )
 
-            if self._stop_flag:
-                self.log_message.emit("扫描已停止", 'warning')
+            if self.stop_flag.value == 1:
+                self.log_message.emit("[停止] 主机扫描已停止", 'warning')
+                self.scan_complete.emit()
                 return
 
             if not alive_hosts:
                 self.log_message.emit("未发现存活主机", 'warning')
+                self.scan_complete.emit()
                 return
 
             self.log_message.emit(f"发现 {len(alive_hosts)} 个存活主机", 'info')
 
             # 阶段2: 端口扫描
             for idx, host_ip in enumerate(alive_hosts):
-                if self._stop_flag:
+                if self.stop_flag.value == 1:
+                    self.log_message.emit("[停止] 端口扫描已停止", 'warning')
                     break
 
                 self.log_message.emit(f"正在扫描主机: {host_ip}", 'info')
 
                 def port_progress(progress, scanned, total):
-                    if not self._stop_flag:
-                        base_progress = 50
-                        per_host_progress = 50 / len(alive_hosts)
-                        self.progress_updated.emit(
-                            int(base_progress + per_host_progress * (idx + progress / 100)),
-                            scanned,
-                            total
-                        )
+                    self.progress_updated.emit(
+                        int(50 + 50 / len(alive_hosts) * (idx + progress / 100)),
+                        scanned,
+                        total
+                    )
 
-                open_ports = scan_ports(
+                # 端口发现时实时通知
+                def port_found_callback(h, p, s):
+                    self.port_found.emit(h, p, s)
+
+                scan_ports(
                     host_ip,
                     self.port_range,
                     max_workers=self.max_workers,
                     timeout=self.timeout,
-                    progress_callback=port_progress
+                    progress_callback=port_progress,
+                    stop_flag=self.stop_flag,
+                    port_found_callback=port_found_callback
                 )
 
-                results.append({
-                    'host': host_ip,
-                    'ports': open_ports
-                })
+                if self.stop_flag.value == 1:
+                    break
 
-                # 实时发送结果
-                if open_ports:
-                    result_text = f"[主机] {host_ip}\n"
-                    result_text += f"{'='*40}\n"
-                    for port_info in open_ports:
-                        result_text += f"  端口: {port_info['port']} - 服务: {port_info['service']}\n"
-                    self.result_ready.emit(result_text)
-
-            self.log_message.emit("扫描完成", 'info')
+            if self.stop_flag.value == 0:
+                self.log_message.emit("扫描完成", 'info')
 
         except Exception as e:
             self.log_message.emit(f"扫描出错: {str(e)}", 'error')
@@ -111,6 +122,7 @@ class ScanThread(QThread):
 
         finally:
             self.progress_updated.emit(100, 100, 100)
+            self.scan_complete.emit()
 
 
 class MainWindow(QMainWindow, UiMain):
@@ -120,6 +132,7 @@ class MainWindow(QMainWindow, UiMain):
         super().__init__()
         self.setup_ui(self)
         self.scan_thread = None
+        self.scan_results = []
 
     def start_scan(self):
         """开始扫描"""
@@ -148,25 +161,24 @@ class MainWindow(QMainWindow, UiMain):
         self.progress_bar.setValue(0)
         self.clear_result()
 
+        self.scan_results = []
+
         log.info(f"开始扫描 - 目标: {host}, 端口: {port_range}")
         self.update_log(f"开始扫描 - 目标: {host}, 端口: {port_range}", 'info')
 
         self.scan_thread = ScanThread(host, port_range, timeout, max_workers)
         self.scan_thread.progress_updated.connect(self.on_progress_updated)
         self.scan_thread.log_message.connect(self.on_log_message)
-        self.scan_thread.result_ready.connect(self.on_result_ready)
-        self.scan_thread.finished.connect(self.on_scan_finished)
+        self.scan_thread.host_found.connect(self.on_host_found)
+        self.scan_thread.port_found.connect(self.on_port_found)
+        self.scan_thread.scan_complete.connect(self.on_scan_complete)
         self.scan_thread.start()
 
     def stop_scan(self):
         """停止扫描"""
         if self.scan_thread and self.scan_thread.isRunning():
             self.scan_thread.stop()
-            self.scan_thread.wait(3000)
-            self.update_log("扫描已停止", 'warning')
             log.warning("扫描被用户停止")
-
-        self.reset_ui()
 
     def on_progress_updated(self, progress, scanned, total):
         """进度更新回调"""
@@ -176,16 +188,49 @@ class MainWindow(QMainWindow, UiMain):
         """日志消息回调"""
         self.update_log(message, level)
 
-    def on_result_ready(self, result_text):
-        """结果准备好回调"""
-        self.update_result(result_text)
+    def on_host_found(self, host):
+        """发现存活主机"""
+        self.update_log(f"[+] 发现存活主机: {host}", 'info')
+        if host not in [r['host'] for r in self.scan_results]:
+            self.scan_results.append({'host': host, 'ports': []})
 
-    def on_scan_finished(self):
-        """扫描全部完成"""
-        self.update_result(f"{'='*40}")
-        self.update_result("扫描完成")
-        log.info("扫描任务完成")
+    def on_port_found(self, host, port, service):
+        """发现开放端口"""
+        self.update_log(f"[+] {host}:{port} [{service}]", 'info')
+        for result in self.scan_results:
+            if result['host'] == host:
+                result['ports'].append({'port': port, 'service': service})
+                break
+
+    def on_scan_complete(self):
+        """扫描完成回调"""
+        self.display_results()
         self.reset_ui()
+
+    def display_results(self):
+        """显示扫描结果"""
+        self.update_result("=" * 50)
+        self.update_result("扫描结果汇总")
+        self.update_result("=" * 50)
+
+        if not self.scan_results:
+            self.update_result("\n未发现存活主机或开放端口")
+            return
+
+        for result in self.scan_results:
+            self.update_result(f"\n[主机] {result['host']}")
+            self.update_result("-" * 40)
+            if result['ports']:
+                for port_info in result['ports']:
+                    self.update_result(f"  端口: {port_info['port']} - 服务: {port_info['service']}")
+            else:
+                self.update_result("  未发现开放端口")
+
+        self.update_result("")
+        if self.scan_thread and self.scan_thread.stop_flag.value == 1:
+            self.update_result("[已停止] 扫描被用户中断")
+        else:
+            self.update_result("[完成] 扫描已完成")
 
     def reset_ui(self):
         """重置UI状态"""
@@ -199,6 +244,7 @@ class MainWindow(QMainWindow, UiMain):
         self.clear_result()
         self.clear_log()
         self.progress_bar.setValue(0)
+        self.scan_results = []
 
 
 def main():
