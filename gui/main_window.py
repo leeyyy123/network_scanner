@@ -30,7 +30,7 @@ class ScanThread(QThread):
 
     progress_updated = pyqtSignal(int, int, int)
     log_message = pyqtSignal(str, str)
-    host_found = pyqtSignal(str)
+    host_found = pyqtSignal(str, str)  # host, method
     port_found = pyqtSignal(str, int, str)
     scan_complete = pyqtSignal()
 
@@ -57,8 +57,8 @@ class ScanThread(QThread):
                 self.progress_updated.emit(int(progress / 2), scanned, total)
 
             # 主机发现时实时通知
-            def host_found_callback(ip):
-                self.host_found.emit(ip)
+            def host_found_callback(ip, method):
+                self.host_found.emit(ip, method)
 
             alive_hosts = scan_hosts(
                 self.host,
@@ -188,9 +188,9 @@ class MainWindow(QMainWindow, UiMain):
         """日志消息回调"""
         self.update_log(message, level)
 
-    def on_host_found(self, host):
+    def on_host_found(self, host, method='TCP'):
         """发现存活主机"""
-        self.update_log(f"[+] 发现存活主机: {host}", 'info')
+        self.update_log(f"[+] 发现存活主机: {host} [{method}]", 'info')
         if host not in [r['host'] for r in self.scan_results]:
             self.scan_results.append({'host': host, 'ports': []})
 

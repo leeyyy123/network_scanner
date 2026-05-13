@@ -36,7 +36,7 @@ class UiMain:
         # IP地址输入
         self.ip_label = QLabel('目标IP/范围:')
         self.ip_input = QLineEdit()
-        self.ip_input.setPlaceholderText('例如: 192.168.1.1 或 192.168.1.1-10')
+        self.ip_input.setPlaceholderText('例如: 192.168.1.1 或 192.168.1.1-192.168.1.10')
         config_layout.addRow(self.ip_label, self.ip_input)
 
         # 端口范围输入

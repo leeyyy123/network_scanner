@@ -2,55 +2,170 @@
 主机扫描模块 - 负责检测目标主机是否存活
 """
 import socket
+import struct
+import ipaddress
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from .logger import log
+try:
+    from .logger import log
+except ImportError:
+    import logging
+    log = logging.getLogger('host_scan')
 
 # 常用检测端口
 CHECK_PORTS = [80, 443, 22, 23, 3389, 445]
 
 
+def tcp_probe(host, port=80, timeout=1):
+    """
+    TCP 连接探测
+
+    Args:
+        host: 目标主机IP
+        port: 端口号
+        timeout: 超时时间(秒)
+
+    Returns:
+        bool: 是否成功连接
+    """
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        result = sock.connect_ex((host, port))
+        sock.close()
+        return result == 0
+    except:
+        return False
+
+
+def icmp_ping(host, timeout=2):
+    """
+    ICMP Ping 探测
+
+    Args:
+        host: 目标主机IP
+        timeout: 超时时间(秒)
+
+    Returns:
+        bool: 是否能 Ping 通
+    """
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+        sock.settimeout(0.5)  # 单次接收超时
+
+        type_code = 8  # Echo Request
+        code = 0
+        checksum = 0
+        identifier = 12345
+        sequence = 1
+
+        header = struct.pack('!BBHHH', type_code, code, checksum, identifier, sequence)
+        data = b'NetScanner' * 8
+        packet = header + data
+        checksum = calculate_checksum(packet)
+        header = struct.pack('!BBHHH', type_code, code, checksum, identifier, sequence)
+        packet = header + data
+
+        sock.sendto(packet, (host, 0))
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            try:
+                recv_packet, addr = sock.recvfrom(1024)
+                # 验证是否为Echo Reply且包长度足够
+                if len(recv_packet) >= 28 and recv_packet[20] == 0:  # Echo Reply
+                    # 验证identifier和sequence是否匹配
+                    recv_id = struct.unpack('!H', recv_packet[24:26])[0]
+                    recv_seq = struct.unpack('!H', recv_packet[26:28])[0]
+                    if recv_id == identifier and recv_seq == sequence:
+                        sock.close()
+                        log.info(f"ICMP Ping 成功: {host}")
+                        return True
+            except socket.timeout:
+                # 单次超时，继续等待直到总超时时间
+                continue
+            except:
+                break
+
+        sock.close()
+        return False
+
+    except PermissionError:
+        log.debug(f"ICMP Ping 需要管理员权限: {host}")
+        return False
+    except Exception as e:
+        log.debug(f"ICMP Ping 失败: {host} - {e}")
+        return False
+
+
+def calculate_checksum(data):
+    """计算 ICMP 校验和"""
+    checksum = 0
+    for i in range(0, len(data), 2):
+        word = (data[i] << 8) + data[i + 1] if i + 1 < len(data) else data[i] << 8
+        checksum = (checksum + word) & 0xFFFF
+    checksum = (checksum >> 16) + (checksum & 0xFFFF)
+    return ~checksum & 0xFFFF
+
+
 def is_host_alive(host, timeout=1):
-    """检测单个主机是否存活"""
+    """
+    检测单个主机是否存活
+
+    Args:
+        host: IP地址字符串
+        timeout: 超时时间(秒)
+
+    Returns:
+        tuple: (bool, str) - 是否存活, 扫描方式
+    """
+    # 优先 ICMP Ping
+    if icmp_ping(host, timeout):
+        return True, "ICMP"
+    # 降级到 TCP 连接检测
     for port in CHECK_PORTS:
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(timeout)
-            result = sock.connect_ex((host, port))
-            sock.close()
-            if result == 0:
-                return True
-        except:
-            continue
-    return False
+        if tcp_probe(host, port, timeout):
+            return True, "TCP"
+    return False, "None"
 
 
 def parse_ip_range(ip_range):
-    """解析IP范围字符串"""
+    """
+    解析IP范围字符串
+
+    支持格式:
+    - 单IP: 192.168.1.1
+    - IP段: 192.168.1.1-192.168.1.10
+    - CIDR: 192.168.1.0/24
+    - 多个用逗号分隔
+    """
     ips = []
     parts = ip_range.replace(' ', '').split(',')
 
     for part in parts:
-        if '-' in part:
-            try:
-                start_ip, end_ip = part.split('-')
-                start_parts = start_ip.split('.')
-                end_parts = end_ip.split('.')
+        try:
+            # 先尝试 CIDR 或单IP
+            net = ipaddress.ip_network(part, strict=False)
+            ips.extend([str(ip) for ip in net.hosts()])
+        except ValueError:
+            # 再尝试 IP 段
+            if '-' in part:
+                try:
+                    start_ip, end_ip = part.split('-')
+                    start = ipaddress.ip_address(start_ip)
+                    end = ipaddress.ip_address(end_ip)
 
-                if len(start_parts) != 4 or len(end_parts) != 4:
-                    continue
+                    current = int(start)
+                    end_int = int(end)
+                    while current <= end_int:
+                        ips.append(str(ipaddress.ip_address(current)))
+                        current += 1
+                except:
+                    pass
+            else:
+                ips.append(part)
 
-                base = '.'.join(start_parts[:3])
-                start_last = int(start_parts[3])
-                end_last = int(end_parts[3])
-
-                for i in range(start_last, end_last + 1):
-                    ips.append(f"{base}.{i}")
-            except:
-                continue
-        else:
-            ips.append(part)
-
-    return ips
+    return list(set(ips))
 
 
 def scan_hosts(ip_range, max_workers=50, timeout=1,
@@ -62,9 +177,9 @@ def scan_hosts(ip_range, max_workers=50, timeout=1,
         ip_range: IP范围字符串
         max_workers: 最大线程数
         timeout: 超时时间(秒)
-        progress_callback: 进度回调函数 (progress, scanned, total)
+        progress_callback: 进度回调函数
         stop_flag: 停止标志对象
-        host_found_callback: 主机发现回调 (ip)
+        host_found_callback: 主机发现回调
     """
     log.info(f"开始扫描主机: {ip_range}")
     ips = parse_ip_range(ip_range)
@@ -78,54 +193,59 @@ def scan_hosts(ip_range, max_workers=50, timeout=1,
     log.info(f"共需扫描 {total} 个IP地址")
 
     def check_stop():
-        if stop_flag is not None:
-            try:
-                return stop_flag.value == 1
-            except:
-                return False
-        return False
+        return stop_flag is not None and stop_flag.value == 1
 
     scanned = [0]
-    results_lock = __import__('threading').Lock()
-
-    def check_host(ip):
-        if check_stop():
-            return False
-        return is_host_alive(ip, timeout)
-
-    def handle_result(future):
-        if check_stop():
-            return
-        scanned[0] += 1
-        ip = futures[future]
-        try:
-            if future.result():
-                with results_lock:
-                    alive_hosts.append(ip)
-                # 立即通知回调
-                if host_found_callback:
-                    host_found_callback(ip)
-                log.info(f"主机在线: {ip}")
-        except:
-            pass
-
-        if progress_callback:
-            progress = int(scanned[0] / total * 100)
-            progress_callback(progress, scanned[0], total)
+    lock = __import__('threading').Lock()
 
     try:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(check_host, ip): ip for ip in ips}
+            futures = {executor.submit(is_host_alive, ip, timeout): ip for ip in ips}
 
             for future in as_completed(futures):
                 if check_stop():
                     for f in futures:
                         f.cancel()
                     break
-                handle_result(future)
+
+                scanned[0] += 1
+                ip = futures[future]
+                try:
+                    alive, method = future.result()
+                    if alive:
+                        with lock:
+                            alive_hosts.append(ip)
+                        if host_found_callback:
+                            host_found_callback(ip, method)
+                        # 记录到日志文件（包含扫描方式）
+                        log.info(f"主机在线: {ip} [{method}]")
+                except:
+                    pass
+
+                if progress_callback:
+                    progress = int(scanned[0] / total * 100)
+                    progress_callback(progress, scanned[0], total)
 
     except Exception as e:
         log.error(f"主机扫描出错: {e}")
 
     log.info(f"主机扫描完成, 发现 {len(alive_hosts)} 个存活主机")
     return alive_hosts
+
+
+if __name__ == '__main__':
+    import sys
+    import os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+    # 导入logger（避免相对导入问题）
+    from core.logger import log
+
+    print("=== CIDR 测试 ===")
+    print(parse_ip_range("192.168.1.0/28"))  # 14个IP
+
+    print("\n=== IP段测试 ===")
+    print(parse_ip_range("192.168.1.1-192.168.1.5"))
+
+    print("\n=== 单主机测试 ===")
+    print(f"127.0.0.1 是否存活: {is_host_alive('127.0.0.1')}")

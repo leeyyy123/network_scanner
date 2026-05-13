@@ -3,8 +3,13 @@
 """
 import socket
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from .logger import log
-from .service_detect import get_service_by_port
+try:
+    from .logger import log
+    from .service_detect import get_service_by_port
+except ImportError:
+    import logging
+    log = logging.getLogger('port_scan')
+    from core.service_detect import get_service_by_port
 
 
 def parse_port_range(port_range):
@@ -89,6 +94,8 @@ def scan_ports(host, port_range, max_workers=100, timeout=1,
                 # 立即通知回调
                 if port_found_callback:
                     port_found_callback(host, result['port'], result['service'])
+                # 记录到日志文件
+                log.info(f"发现开放端口: {host}:{result['port']} [{result['service']}]")
         except:
             pass
 
