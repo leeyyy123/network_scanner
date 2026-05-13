@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import QMainWindow, QMessageBox, QApplication
 from PyQt5.QtCore import QThread, pyqtSignal
 from gui.ui_main import UiMain
 from core.logger import log
-from core.host_scan import scan_hosts
+from core.host_scan import scan_hosts, parse_ip_range
 from core.port_scan import scan_ports
 
 
@@ -145,6 +145,12 @@ class MainWindow(QMainWindow, UiMain):
 
         if not port_range:
             QMessageBox.warning(self, '输入错误', '请输入端口范围')
+            return
+
+        # 验证IP格式
+        ips = parse_ip_range(host)
+        if not ips:
+            QMessageBox.warning(self, '输入错误', '无效的IP地址或范围')
             return
 
         try:

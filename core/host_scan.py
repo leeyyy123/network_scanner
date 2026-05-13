@@ -4,7 +4,6 @@
 
 import ipaddress
 from scapy.all import IP, TCP, sr1, sr
-import time
 import ctypes
 from ping3 import ping
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -31,6 +30,23 @@ except:
     pass
 
 
+def is_valid_ip(ip_str):
+    """
+    验证IP字符串是否合法
+
+    Args:
+        ip_str: IP地址字符串
+
+    Returns:
+        bool: 是否是合法IP
+    """
+    try:
+        ipaddress.ip_address(ip_str)
+        return True
+    except ValueError:
+        return False
+
+
 def icmp_ping(host, timeout=1):
     """
     ICMP Ping 探测
@@ -42,18 +58,20 @@ def icmp_ping(host, timeout=1):
     Returns:
         bool: 是否能 Ping 通
     """
+    if not is_valid_ip(host):
+        log.debug(f"无效IP地址: {host}")
+        return False
+
     try:
-        # 使用 ping3 库发送 ICMP 请求
-        # ping3 返回延迟(秒)或 None(超时/失败)
         response = ping(host, timeout=timeout)
-        
+
         if response is not None:
             log.info(f"ICMP Ping 成功: {host} (延迟: {response*1000:.2f}ms)")
             return True
         else:
             log.debug(f"ICMP Ping 超时: {host}")
             return False
-            
+
     except PermissionError:
         log.debug(f"ICMP Ping 需要管理员权限: {host}")
         return False
@@ -64,7 +82,7 @@ def icmp_ping(host, timeout=1):
 
 def tcp_syn_probe(host, port=80, timeout=1):
     """
-    TCP SYN 探测 (使用非阻塞连接模拟SYN探测)
+    TCP SYN 探测 (使用 scapy 发送 SYN 包)
 
     Args:
         host: 目标主机IP
@@ -74,32 +92,30 @@ def tcp_syn_probe(host, port=80, timeout=1):
     Returns:
         bool: 是否存活
     """
+    if not is_valid_ip(host):
+        log.debug(f"无效IP地址: {host}")
+        return False
+
     try:
-        # 构建 SYN 包
         syn_packet = IP(dst=host) / TCP(dport=port, flags='S')
-        
-        # 发送并等待响应
-        response = sr1(syn_packet, timeout=timeout, verbose=False)
-        
+        response = sr1(syn_packet, timeout=timeout, verbose=0)
+
         if response:
-            # 如果收到 SYN/ACK，端口开放，主机存活
             if response.haslayer(TCP) and response.getlayer(TCP).flags == 0x12:
-                # 发送 RST 关闭连接
                 rst_packet = IP(dst=host) / TCP(dport=port, flags='R')
-                sr(rst_packet, timeout=1, verbose=False)
+                sr(rst_packet, timeout=1, verbose=0)
                 return True
-            # 如果收到 RST，端口关闭但主机存活
             elif response.haslayer(TCP) and response.getlayer(TCP).flags == 0x14:
                 return True
         return False
     except Exception as e:
-        print(f"TCP SYN probe error: {e}")
+        log.debug(f"TCP SYN 探测失败: {host}:{port} - {e}")
         return False
 
 
 def tcp_ack_probe(host, port=80, timeout=1):
     """
-    TCP ACK 探测 (发送ACK包, 根据是否收到RST判断主机存活)
+    TCP ACK 探测 (使用 scapy 发送 ACK 包)
 
     Args:
         host: 目标主机IP
@@ -109,20 +125,20 @@ def tcp_ack_probe(host, port=80, timeout=1):
     Returns:
         bool: 是否存活
     """
+    if not is_valid_ip(host):
+        log.debug(f"无效IP地址: {host}")
+        return False
+
     try:
-        # 构建 ACK 包（使用随机序列号）
         ack_packet = IP(dst=host) / TCP(dport=port, flags='A', seq=12345)
-        
-        # 发送并等待响应
-        response = sr1(ack_packet, timeout=timeout, verbose=False)
-        
+        response = sr1(ack_packet, timeout=timeout, verbose=0)
+
         if response and response.haslayer(TCP):
-            # 收到 RST 包说明主机存活
             if response.getlayer(TCP).flags == 0x14:
                 return True
         return False
     except Exception as e:
-        print(f"TCP ACK probe error: {e}")
+        log.debug(f"TCP ACK 探测失败: {host}:{port} - {e}")
         return False
 
 
@@ -141,13 +157,13 @@ def is_host_alive(host, timeout=1):
     if icmp_ping(host, timeout):
         return True, ProbeType.ICMP
 
-    # 第二优先级: TCP SYN 探测
-    for port in CHECK_PORTS:
+    # 第二优先级: TCP SYN 探测（减少端口数量提高速度）
+    for port in CHECK_PORTS[:2]:  # 只测试前2个端口，避免卡顿
         if tcp_syn_probe(host, port, timeout):
             return True, ProbeType.TCP_SYN
 
     # 第三优先级: TCP ACK 探测
-    for port in CHECK_PORTS:
+    for port in CHECK_PORTS[:1]:  # 只测试1个端口
         if tcp_ack_probe(host, port, timeout):
             return True, ProbeType.TCP_ACK
 
@@ -188,7 +204,12 @@ def parse_ip_range(ip_range):
                 except:
                     pass
             else:
-                ips.append(part)
+                # 检查单IP是否合法
+                try:
+                    ipaddress.ip_address(part)
+                    ips.append(part)
+                except ValueError:
+                    log.warning(f"无效IP地址: {part}")
 
     return list(set(ips))
 
@@ -244,7 +265,7 @@ def scan_hosts(ip_range, max_workers=50, timeout=1,
                             host_found_callback(ip, method)
                         # 记录到日志文件（包含扫描方式）
                         log.info(f"主机在线: {ip} [{method}]")
-                except:
+                except Exception as e:
                     pass
 
                 if progress_callback:
@@ -274,3 +295,7 @@ if __name__ == '__main__':
 
     print("\n=== 单主机测试 ===")
     print(f"127.0.0.1 是否存活: {is_host_alive('127.0.0.1')}")
+
+    # 测试不存在的 IP
+    print(f"\n测试不存在的主机: 192.168.142.7")
+    print(f"结果: {is_host_alive('192.168.142.7', timeout=2)}")
