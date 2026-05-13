@@ -45,7 +45,7 @@ class ScanThread(QThread):
     def stop(self):
         """请求停止扫描"""
         self.stop_flag.stop()
-        self.log_message.emit("[停止] 正在停止扫描...", 'warning')
+        self.log_message.emit("[停止] 已停止扫描", 'warning')
 
     def run(self):
         """执行扫描"""
@@ -188,7 +188,7 @@ class MainWindow(QMainWindow, UiMain):
         """日志消息回调"""
         self.update_log(message, level)
 
-    def on_host_found(self, host, method='TCP'):
+    def on_host_found(self, host, method='ICMP'):
         """发现存活主机"""
         self.update_log(f"[+] 发现存活主机: {host} [{method}]", 'info')
         if host not in [r['host'] for r in self.scan_results]:

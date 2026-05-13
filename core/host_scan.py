@@ -1,10 +1,11 @@
 """
 主机扫描模块 - 负责检测目标主机是否存活
 """
-import socket
-import struct
+
 import ipaddress
+from scapy.all import IP, TCP, sr1, sr
 import time
+import ctypes
 from ping3 import ping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 try:
@@ -13,30 +14,21 @@ except ImportError:
     import logging
     log = logging.getLogger('host_scan')
 
+# 探测类型枚举
+class ProbeType:
+    ICMP = "ICMP"
+    TCP_SYN = "TCP-SYN"
+    TCP_ACK = "TCP-ACK"
+
 # 常用检测端口
 CHECK_PORTS = [80, 443, 22, 23, 3389, 445]
 
-
-def tcp_probe(host, port=80, timeout=1):
-    """
-    TCP 连接探测
-
-    Args:
-        host: 目标主机IP
-        port: 端口号
-        timeout: 超时时间(秒)
-
-    Returns:
-        bool: 是否成功连接
-    """
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
-        result = sock.connect_ex((host, port))
-        sock.close()
-        return result == 0
-    except:
-        return False
+# Windows 网络库
+WS2_32 = None
+try:
+    WS2_32 = ctypes.windll.ws2_32
+except:
+    pass
 
 
 def icmp_ping(host, timeout=1):
@@ -70,9 +62,73 @@ def icmp_ping(host, timeout=1):
         return False
 
 
+def tcp_syn_probe(host, port=80, timeout=1):
+    """
+    TCP SYN 探测 (使用非阻塞连接模拟SYN探测)
+
+    Args:
+        host: 目标主机IP
+        port: 端口号
+        timeout: 超时时间(秒)
+
+    Returns:
+        bool: 是否存活
+    """
+    try:
+        # 构建 SYN 包
+        syn_packet = IP(dst=host) / TCP(dport=port, flags='S')
+        
+        # 发送并等待响应
+        response = sr1(syn_packet, timeout=timeout, verbose=False)
+        
+        if response:
+            # 如果收到 SYN/ACK，端口开放，主机存活
+            if response.haslayer(TCP) and response.getlayer(TCP).flags == 0x12:
+                # 发送 RST 关闭连接
+                rst_packet = IP(dst=host) / TCP(dport=port, flags='R')
+                sr(rst_packet, timeout=1, verbose=False)
+                return True
+            # 如果收到 RST，端口关闭但主机存活
+            elif response.haslayer(TCP) and response.getlayer(TCP).flags == 0x14:
+                return True
+        return False
+    except Exception as e:
+        print(f"TCP SYN probe error: {e}")
+        return False
+
+
+def tcp_ack_probe(host, port=80, timeout=1):
+    """
+    TCP ACK 探测 (发送ACK包, 根据是否收到RST判断主机存活)
+
+    Args:
+        host: 目标主机IP
+        port: 端口号
+        timeout: 超时时间(秒)
+
+    Returns:
+        bool: 是否存活
+    """
+    try:
+        # 构建 ACK 包（使用随机序列号）
+        ack_packet = IP(dst=host) / TCP(dport=port, flags='A', seq=12345)
+        
+        # 发送并等待响应
+        response = sr1(ack_packet, timeout=timeout, verbose=False)
+        
+        if response and response.haslayer(TCP):
+            # 收到 RST 包说明主机存活
+            if response.getlayer(TCP).flags == 0x14:
+                return True
+        return False
+    except Exception as e:
+        print(f"TCP ACK probe error: {e}")
+        return False
+
+
 def is_host_alive(host, timeout=1):
     """
-    检测单个主机是否存活
+    检测单个主机是否存活 (按优先级顺序探测: ICMP -> TCP-SYN -> TCP-ACK)
 
     Args:
         host: IP地址字符串
@@ -81,13 +137,20 @@ def is_host_alive(host, timeout=1):
     Returns:
         tuple: (bool, str) - 是否存活, 扫描方式
     """
-    # 优先 ICMP Ping
+    # 第一优先级: ICMP Ping
     if icmp_ping(host, timeout):
-        return True, "ICMP"
-    # 降级到 TCP 连接检测
+        return True, ProbeType.ICMP
+
+    # 第二优先级: TCP SYN 探测
     for port in CHECK_PORTS:
-        if tcp_probe(host, port, timeout):
-            return True, "TCP"
+        if tcp_syn_probe(host, port, timeout):
+            return True, ProbeType.TCP_SYN
+
+    # 第三优先级: TCP ACK 探测
+    for port in CHECK_PORTS:
+        if tcp_ack_probe(host, port, timeout):
+            return True, ProbeType.TCP_ACK
+
     return False, "None"
 
 
