@@ -5,6 +5,7 @@ import socket
 import struct
 import ipaddress
 import time
+from ping3 import ping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 try:
     from .logger import log
@@ -38,7 +39,7 @@ def tcp_probe(host, port=80, timeout=1):
         return False
 
 
-def icmp_ping(host, timeout=2):
+def icmp_ping(host, timeout=1):
     """
     ICMP Ping 探测
 
@@ -50,62 +51,23 @@ def icmp_ping(host, timeout=2):
         bool: 是否能 Ping 通
     """
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
-        sock.settimeout(0.5)  # 单次接收超时
-
-        type_code = 8  # Echo Request
-        code = 0
-        checksum = 0
-        identifier = 12345
-        sequence = 1
-
-        header = struct.pack('!BBHHH', type_code, code, checksum, identifier, sequence)
-        data = b'NetScanner' * 8
-        packet = header + data
-        checksum = calculate_checksum(packet)
-        header = struct.pack('!BBHHH', type_code, code, checksum, identifier, sequence)
-        packet = header + data
-
-        sock.sendto(packet, (host, 0))
-        start_time = time.time()
-
-        while time.time() - start_time < timeout:
-            try:
-                recv_packet, addr = sock.recvfrom(1024)
-                # 验证是否为Echo Reply且包长度足够
-                if len(recv_packet) >= 28 and recv_packet[20] == 0:  # Echo Reply
-                    # 验证identifier和sequence是否匹配
-                    recv_id = struct.unpack('!H', recv_packet[24:26])[0]
-                    recv_seq = struct.unpack('!H', recv_packet[26:28])[0]
-                    if recv_id == identifier and recv_seq == sequence:
-                        sock.close()
-                        log.info(f"ICMP Ping 成功: {host}")
-                        return True
-            except socket.timeout:
-                # 单次超时，继续等待直到总超时时间
-                continue
-            except:
-                break
-
-        sock.close()
-        return False
-
+        # 使用 ping3 库发送 ICMP 请求
+        # ping3 返回延迟(秒)或 None(超时/失败)
+        response = ping(host, timeout=timeout)
+        
+        if response is not None:
+            log.info(f"ICMP Ping 成功: {host} (延迟: {response*1000:.2f}ms)")
+            return True
+        else:
+            log.debug(f"ICMP Ping 超时: {host}")
+            return False
+            
     except PermissionError:
         log.debug(f"ICMP Ping 需要管理员权限: {host}")
         return False
     except Exception as e:
         log.debug(f"ICMP Ping 失败: {host} - {e}")
         return False
-
-
-def calculate_checksum(data):
-    """计算 ICMP 校验和"""
-    checksum = 0
-    for i in range(0, len(data), 2):
-        word = (data[i] << 8) + data[i + 1] if i + 1 < len(data) else data[i] << 8
-        checksum = (checksum + word) & 0xFFFF
-    checksum = (checksum >> 16) + (checksum & 0xFFFF)
-    return ~checksum & 0xFFFF
 
 
 def is_host_alive(host, timeout=1):
