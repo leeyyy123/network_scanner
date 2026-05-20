@@ -3,7 +3,7 @@ UI设计模块 - 定义GUI界面的布局和组件
 """
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QLineEdit, QPushButton, QTextEdit, QProgressBar,
-                             QGroupBox, QFormLayout, QCheckBox)
+                             QGroupBox, QFormLayout, QCheckBox, QComboBox)
 from PyQt5.QtCore import Qt
 
 
@@ -36,35 +36,29 @@ class UiMain:
         # IP地址输入
         self.ip_label = QLabel('目标IP/范围:')
         self.ip_input = QLineEdit()
-        self.ip_input.setPlaceholderText('例如: 192.168.1.1 或 192.168.1.1-192.168.1.10')
+        self.ip_input.setPlaceholderText('例如: 192.168.1.1 或 192.168.1.0/30 或 192.168.1.1-192.168.1.10')
         config_layout.addRow(self.ip_label, self.ip_input)
 
-        # 端口范围输入
+        # 扫描模式选择
+        self.scan_mode_label = QLabel('扫描模式:')
+        self.scan_mode_combo = QComboBox()
+        self.scan_mode_combo.addItems([
+            '主机发现',
+            '快速扫描',
+            '标准扫描',
+            'SYN扫描',
+            '指定端口'
+        ])
+        self.scan_mode_combo.setMinimumWidth(200)
+        config_layout.addRow(self.scan_mode_label, self.scan_mode_combo)
+
+        # 指定端口输入框（默认隐藏）
         self.port_label = QLabel('端口范围:')
         self.port_input = QLineEdit()
-        self.port_input.setPlaceholderText('例如: 80, 443, 22 或 1-1024')
-        self.port_input.setText('1-1024')
+        self.port_input.setPlaceholderText('例如: 80,443,22 或 1-1000')
+        self.port_label.setVisible(False)
+        self.port_input.setVisible(False)
         config_layout.addRow(self.port_label, self.port_input)
-
-        # 高级选项折叠区域
-        self.advanced_widget = QWidget()
-        advanced_layout = QFormLayout(self.advanced_widget)
-
-        # 超时设置
-        self.timeout_label = QLabel('超时时间(秒):')
-        self.timeout_input = QLineEdit()
-        self.timeout_input.setText('1')
-        self.timeout_input.setMaximumWidth(100)
-        advanced_layout.addRow(self.timeout_label, self.timeout_input)
-
-        # 线程数设置
-        self.threads_label = QLabel('线程数:')
-        self.threads_input = QLineEdit()
-        self.threads_input.setText('50')
-        self.threads_input.setMaximumWidth(100)
-        advanced_layout.addRow(self.threads_label, self.threads_input)
-
-        config_layout.addRow(self.advanced_widget)
 
         config_group.setLayout(config_layout)
         main_layout.addWidget(config_group)

@@ -9,8 +9,8 @@ from PyQt5.QtWidgets import QMainWindow, QMessageBox, QApplication
 from PyQt5.QtCore import QThread, pyqtSignal
 from gui.ui_main import UiMain
 from core.logger import log
-from core.host_scan import scan_hosts, parse_ip_range
-from core.port_scan import scan_ports
+from core.host_scan import scan_hosts_with_methods, parse_ip_range
+from core.port_scan import scan_ports, RECOMMENDED_MODES, SCAN_MODE_NAMES, parse_port_range
 
 
 class StopFlag:
@@ -31,15 +31,15 @@ class ScanThread(QThread):
     progress_updated = pyqtSignal(int, int, int)
     log_message = pyqtSignal(str, str)
     host_found = pyqtSignal(str, str)  # host, method
-    port_found = pyqtSignal(str, int, str)
+    port_found = pyqtSignal(str, int, str, str)  # host, port, service, state
     scan_complete = pyqtSignal()
 
-    def __init__(self, host, port_range, timeout, max_workers):
+    def __init__(self, host, mode_id, custom_ports=None):
         super().__init__()
         self.host = host
-        self.port_range = port_range
-        self.timeout = timeout
-        self.max_workers = max_workers
+        self.mode_id = mode_id
+        self.custom_ports = custom_ports or []
+        self.scan_mode = RECOMMENDED_MODES.get(mode_id, RECOMMENDED_MODES['fast'])
         self.stop_flag = StopFlag()
 
     def stop(self):
@@ -50,27 +50,61 @@ class ScanThread(QThread):
     def run(self):
         """执行扫描"""
         try:
-            # 阶段1: 主机扫描
+            # 阶段1: 主机发现
+            if self.scan_mode.get('port_scan') is None:
+                # ping模式: 仅主机发现，不扫描端口
+                self.log_message.emit(f"开始主机发现: {self.host}", 'info')
+
+                def host_progress(progress, scanned, total):
+                    self.progress_updated.emit(progress, scanned, total)
+
+                def host_found_callback(ip, method):
+                    self.host_found.emit(ip, method)
+
+                alive_hosts = scan_hosts_with_methods(
+                    self.host,
+                    ['icmp', 'tcp-syn', 'tcp-ack'],
+                    max_workers=100,
+                    timeout=1,
+                    progress_callback=host_progress,
+                    stop_flag=self.stop_flag,
+                    host_found_callback=host_found_callback
+                )
+
+                if self.stop_flag.value == 1:
+                    self.log_message.emit("[停止] 主机发现已停止", 'warning')
+                    self.scan_complete.emit()
+                    return
+
+                if alive_hosts:
+                    self.log_message.emit(f"发现 {len(alive_hosts)} 个存活主机", 'info')
+                else:
+                    self.log_message.emit("未发现存活主机", 'warning')
+
+                self.scan_complete.emit()
+                return
+
+            # 其他模式: 先主机发现，再端口扫描
             self.log_message.emit(f"开始主机发现: {self.host}", 'info')
 
             def host_progress(progress, scanned, total):
                 self.progress_updated.emit(int(progress / 2), scanned, total)
 
-            # 主机发现时实时通知
             def host_found_callback(ip, method):
                 self.host_found.emit(ip, method)
 
-            alive_hosts = scan_hosts(
+            alive_hosts = scan_hosts_with_methods(
                 self.host,
-                max_workers=self.max_workers,
-                timeout=self.timeout,
+                ['icmp', 'tcp-syn', 'tcp-ack'],
+                max_workers=100,
+                timeout=1,
                 progress_callback=host_progress,
                 stop_flag=self.stop_flag,
                 host_found_callback=host_found_callback
             )
 
             if self.stop_flag.value == 1:
-                self.log_message.emit("[停止] 主机扫描已停止", 'warning')
+                self.log_message.emit("[停止] 主机发现已停止", 'warning')
                 self.scan_complete.emit()
                 return
 
@@ -82,6 +116,15 @@ class ScanThread(QThread):
             self.log_message.emit(f"发现 {len(alive_hosts)} 个存活主机", 'info')
 
             # 阶段2: 端口扫描
+            # 指定端口模式使用custom_ports，其他模式使用预设ports
+            if self.custom_ports:
+                port_list = self.custom_ports
+            else:
+                port_list = self.scan_mode.get('ports', [])
+
+            scan_type = self.scan_mode.get('port_scan', 'tcp-syn')
+            self.log_message.emit(f"端口数量: {len(port_list)}, 类型: {scan_type}", 'info')
+
             for idx, host_ip in enumerate(alive_hosts):
                 if self.stop_flag.value == 1:
                     self.log_message.emit("[停止] 端口扫描已停止", 'warning')
@@ -97,17 +140,16 @@ class ScanThread(QThread):
                     )
 
                 # 端口发现时实时通知
-                def port_found_callback(h, p, s):
-                    self.port_found.emit(h, p, s)
+                def port_found_callback(h, p, s, state):
+                    self.port_found.emit(h, p, s, state)
 
                 scan_ports(
                     host_ip,
-                    self.port_range,
-                    max_workers=self.max_workers,
-                    timeout=self.timeout,
+                    port_list,
                     progress_callback=port_progress,
                     stop_flag=self.stop_flag,
-                    port_found_callback=port_found_callback
+                    port_found_callback=port_found_callback,
+                    scan_type=scan_type
                 )
 
                 if self.stop_flag.value == 1:
@@ -133,18 +175,28 @@ class MainWindow(QMainWindow, UiMain):
         self.setup_ui(self)
         self.scan_thread = None
         self.scan_results = []
+        self.current_mode_id = None
+        self._displayed = False
+
+        # 模式切换时显示/隐藏端口输入框
+        self.scan_mode_combo.currentTextChanged.connect(self.on_mode_changed)
+
+    def on_mode_changed(self, mode_name):
+        """模式切换时调用"""
+        mode_id = SCAN_MODE_NAMES.get(mode_name, 'fast')
+        if mode_id == 'custom':
+            self.port_label.setVisible(True)
+            self.port_input.setVisible(True)
+        else:
+            self.port_label.setVisible(False)
+            self.port_input.setVisible(False)
 
     def start_scan(self):
         """开始扫描"""
         host = self.ip_input.text().strip()
-        port_range = self.port_input.text().strip()
 
         if not host:
             QMessageBox.warning(self, '输入错误', '请输入目标IP地址或范围')
-            return
-
-        if not port_range:
-            QMessageBox.warning(self, '输入错误', '请输入端口范围')
             return
 
         # 验证IP格式
@@ -153,26 +205,38 @@ class MainWindow(QMainWindow, UiMain):
             QMessageBox.warning(self, '输入错误', '无效的IP地址或范围')
             return
 
-        try:
-            timeout = float(self.timeout_input.text() or '1')
-            max_workers = int(self.threads_input.text() or '50')
-        except ValueError:
-            QMessageBox.warning(self, '输入错误', '请输入有效的超时时间和线程数')
-            return
+        # 获取扫描模式
+        mode_name = self.scan_mode_combo.currentText()
+        mode_id = SCAN_MODE_NAMES.get(mode_name, 'fast')
+
+        # 指定端口模式需要验证端口输入
+        custom_ports = []
+        if mode_id == 'custom':
+            port_str = self.port_input.text().strip()
+            if not port_str:
+                QMessageBox.warning(self, '输入错误', '请输入端口范围')
+                return
+            custom_ports = parse_port_range(port_str)
+            if not custom_ports:
+                QMessageBox.warning(self, '输入错误', '无效的端口范围')
+                return
 
         self.scan_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.ip_input.setEnabled(False)
-        self.port_input.setEnabled(False)
+        self.scan_mode_combo.setEnabled(False)
         self.progress_bar.setValue(0)
         self.clear_result()
 
+        self.current_mode_id = mode_id
         self.scan_results = []
+        self._displayed = False
 
-        log.info(f"开始扫描 - 目标: {host}, 端口: {port_range}")
-        self.update_log(f"开始扫描 - 目标: {host}, 端口: {port_range}", 'info')
+        mode_info = RECOMMENDED_MODES[mode_id]
+        port_desc = f"{len(custom_ports)}个端口" if mode_id == 'custom' else mode_info['desc']
+        self.update_log(f"扫描模式: {port_desc}", 'info')
 
-        self.scan_thread = ScanThread(host, port_range, timeout, max_workers)
+        self.scan_thread = ScanThread(host, mode_id, custom_ports)
         self.scan_thread.progress_updated.connect(self.on_progress_updated)
         self.scan_thread.log_message.connect(self.on_log_message)
         self.scan_thread.host_found.connect(self.on_host_found)
@@ -196,21 +260,32 @@ class MainWindow(QMainWindow, UiMain):
 
     def on_host_found(self, host, method='ICMP'):
         """发现存活主机"""
-        self.update_log(f"[+] 发现存活主机: {host} [{method}]", 'info')
+        self.update_log(f"[+] 发现存活主机: {host}", 'info')
         if host not in [r['host'] for r in self.scan_results]:
             self.scan_results.append({'host': host, 'ports': []})
 
-    def on_port_found(self, host, port, service):
-        """发现开放端口"""
-        self.update_log(f"[+] {host}:{port} [{service}]", 'info')
+    def on_port_found(self, host, port, service, state):
+        """发现端口 - 只处理开放状态的端口"""
+        if state != 'open':
+            return  # 忽略被过滤的端口
+        state_display = {
+            'open': '开放',
+            'closed': '关闭',
+            'filtered': '被过滤',
+            'open|filtered': '开放或过滤'
+        }
+        state_text = state_display.get(state, state)
+        self.update_log(f"[+] {host}:{port} [{service}] - {state_text}", 'info')
         for result in self.scan_results:
             if result['host'] == host:
-                result['ports'].append({'port': port, 'service': service})
+                result['ports'].append({'port': port, 'service': service, 'state': state})
                 break
 
     def on_scan_complete(self):
         """扫描完成回调"""
-        self.display_results()
+        if not self._displayed:
+            self._displayed = True
+            self.display_results()
         self.reset_ui()
 
     def display_results(self):
@@ -223,13 +298,22 @@ class MainWindow(QMainWindow, UiMain):
             self.update_result("\n未发现存活主机或开放端口")
             return
 
+        state_display = {
+            'open': 'open',
+            'closed': 'closed',
+            'filtered': 'filtered',
+            'open|filtered': 'open|filtered'
+        }
+
         for result in self.scan_results:
             self.update_result(f"\n[主机] {result['host']}")
             self.update_result("-" * 40)
+            # 仅端口扫描模式才显示"未发现开放端口"
             if result['ports']:
                 for port_info in result['ports']:
-                    self.update_result(f"  端口: {port_info['port']} - 服务: {port_info['service']}")
-            else:
+                    state = state_display.get(port_info.get('state', 'open'), 'open')
+                    self.update_result(f"  {port_info['port']}/{state} - {port_info['service']}")
+            elif self.current_mode_id != 'ping':
                 self.update_result("  未发现开放端口")
 
         self.update_result("")
@@ -243,7 +327,7 @@ class MainWindow(QMainWindow, UiMain):
         self.scan_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.ip_input.setEnabled(True)
-        self.port_input.setEnabled(True)
+        self.scan_mode_combo.setEnabled(True)
 
     def clear_results(self):
         """清除所有结果"""
@@ -251,6 +335,7 @@ class MainWindow(QMainWindow, UiMain):
         self.clear_log()
         self.progress_bar.setValue(0)
         self.scan_results = []
+        self._displayed = False
 
 
 def main():

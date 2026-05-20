@@ -70,6 +70,9 @@ PORT_SERVICES = {
     139: 'NetBIOS-SSN',
     445: 'SMB',
     902: 'VMware',
+    912: 'VMware-Auth',
+    5040: 'SCard-Svr',
+    7680: 'MDNS',
     3300: 'MySQL-Cluster',
 }
 

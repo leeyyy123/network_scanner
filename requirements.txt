@@ -1,1 +1,4 @@
 PyQt5>=5.15.0
+scapy>=3.0.0
+ping3>=4.0.0
+PyInstaller>=5.0.0
